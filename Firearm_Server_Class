@@ -1,0 +1,116 @@
+-- Authorized Use By SCP USNEOM and Galicate
+
+-- Programmer : Galicate
+
+--// SERVICES //--
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// FILES //--
+local Knit = require(ReplicatedStorage.KnitPackage.Knit)
+local FirearmServer = {}
+local ItemClass = require(ReplicatedStorage.Modules.Classes.ItemClasses.Item)
+local FastCast = require(ReplicatedStorage.Modules.Classes.FastCast)
+FastCast.VisualizeCasts = false
+local PartCache = require(ReplicatedStorage.Modules.Classes.PartCache)
+local WorldToGui = require(ReplicatedStorage.Modules.Util.WorldToGui)
+local FirearmBulletHandler = require(ReplicatedStorage.Modules.Util.FirearmBulletHandler)
+local Comm = require(ReplicatedStorage.KnitPackage.Comm).ServerComm
+
+--// CONSTANTS //--
+local COSMETIC_BULLETS_FOLDER = workspace:FindFirstChild("CosmeticBulletsFolder") or Instance.new("Folder", workspace)
+COSMETIC_BULLETS_FOLDER.Name = "CosmeticBulletsFolder"
+
+local SERVER_COMM = Comm.new(ReplicatedStorage.Events.ItemEvents, script.Name)
+local FIRE_SIGNAL = SERVER_COMM:CreateSignal("Fire")
+local RELOAD_SIGNAL = SERVER_COMM:CreateSignal("Reload")
+local SWITCH_FIRETYPE_SIGNAL = SERVER_COMM:CreateSignal("SwitchFireType")
+local SWITCH_STANCE_SIGNAL = SERVER_COMM:CreateSignal("SwitchStance")
+
+--// VARIABLES //--
+local cache = {}
+
+--// FUNCTIONS //--
+function FirearmServer.new(instance)
+	local self = setmetatable(ItemClass.new(instance), FirearmServer)
+	
+	cache[instance] = self
+	
+	-- Config
+	self.config = require(ReplicatedStorage.Modules.Configs.ItemConfigs:FindFirstChild(instance.Name))
+	
+	-- Replicated Data
+	self.ammo = self.config.MagazineCapacity
+	self.fireType = self.config.FireTypes[1]
+	self.magazines = 4
+	
+	-- Item Events
+	self.Equipped:Connect(function()
+		self:Equip()
+	end)
+	self.Unequipped:Connect(function()
+		self:Unequip()
+	end)
+
+	return self
+end
+
+function FirearmServer:Fire(origin, direction)
+	if self.ammo < 1 then return end
+	self.ammo -= 1
+	FIRE_SIGNAL:FireExcept(self.player, self.instance, origin, direction)
+end
+
+function FirearmServer:Reload()
+	self.ammo = self.config.MagazineCapacity
+	RELOAD_SIGNAL:FireExcept(self.player, self.instance)
+end
+
+function FirearmServer:SwitchFireType(fireType)
+	self.fireType = fireType
+	SWITCH_FIRETYPE_SIGNAL:FireExcept(self.player, self.instance, fireType)
+end
+
+function FirearmServer:SwitchStance(oldStance, newStance)
+	SWITCH_STANCE_SIGNAL:FireExcept(self.player, self.instance)
+end
+
+function FirearmServer:Equip()
+	
+	if self.instance:FindFirstChild("Shield") then
+		self.shieldWeld = Instance.new("Motor6D")
+		self.shieldWeld.Parent = self.instance.Shield.Handle
+		self.shieldWeld.Part0 = self.character.LeftLowerArm
+		self.shieldWeld.Part1 = self.instance.Shield.Handle
+		
+		self.shieldWeld.C0 = CFrame.Angles(math.rad(-90), math.rad(90), 0) * CFrame.new(0, 0, -0.3)
+	end
+end
+
+function FirearmServer:Unequip()
+	if self.shieldWeld then
+		self.shieldWeld:Destroy()
+	end
+end
+
+function FirearmServer:GetReplicatedData()
+	return {ammo = self.ammo, fireType = self.fireType, magazines = self.magazines}
+end
+
+--// HOOKS //--
+FIRE_SIGNAL:Connect(function(player, instance, origin, direction)
+	FirearmServer.Fire(cache[instance], origin, direction)
+end)
+RELOAD_SIGNAL:Connect(function(player, instance)
+	FirearmServer.Reload(cache[instance])
+end)
+SWITCH_FIRETYPE_SIGNAL:Connect(function(player, instance, fireType)
+	FirearmServer.SwitchFireType(cache[instance], fireType)
+end)
+SWITCH_STANCE_SIGNAL:Connect(function(player, instance, oldStance, newStance)
+	FirearmServer.SwitchStance(cache[instance], oldStance, newStance)
+end)
+
+--// EXECUTION //--
+FirearmServer.__index = FirearmServer
+setmetatable(FirearmServer, ItemClass)
+return FirearmServer
