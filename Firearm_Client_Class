@@ -1,0 +1,640 @@
+-- Authorized Use By SCP USNEOM and Galicate
+
+-- Programmer : Galicate
+
+--// SERVICES //--
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PlayersService = game:GetService("Players")
+local LightingService = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local ContextActionService = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+
+--// FILES //--
+local FirearmClient = {}
+local Knit = require(ReplicatedStorage.KnitPackage.Knit)
+local ItemClass = require(ReplicatedStorage.Modules.Classes.ItemClasses.Item)
+local AnimationController = require(ReplicatedStorage.Modules.Classes.AnimationController)
+local Spring = require(ReplicatedStorage.Modules.Util.Spring)
+local EnumList = require(ReplicatedStorage.KnitPackage.EnumList)
+local Lerp = require(ReplicatedStorage.Modules.Functions.Lerp)
+local BulletCaster = require(script.BulletCaster)
+local Comm = require(ReplicatedStorage.KnitPackage.Comm).ClientComm
+
+--// CONSTANTS //--
+local PLAYER = PlayersService.LocalPlayer
+local MOUSE = PLAYER:GetMouse()
+local CAMERA = workspace.CurrentCamera
+local CLIENT_COMM = Comm.new(ReplicatedStorage.Events.ItemEvents, false, script.Name)
+
+local STANCE_ENUMS = EnumList.new("FirearmStances", {
+	"Idle",
+	"Ready",
+	"Aiming",
+	"Sprinting",
+})
+
+--// VARIABLES //--
+local cache = {}
+
+--// FUNCTIONS //--
+local function dropMagazine(magazine)
+	-- Clone Magazine
+	local clonedMag = magazine:Clone()
+	clonedMag.CanCollide = true
+	clonedMag.Parent = workspace
+	clonedMag.CFrame = magazine.CFrame
+
+	-- Remove Original Magazine
+	magazine.Transparency = 1
+
+	-- Play Hit Sound
+	local touchedConnection = nil
+	touchedConnection = clonedMag.Touched:Connect(function(hitPart)
+		local model = hitPart:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			return
+		end
+		clonedMag.MagDrop:Play()
+		touchedConnection:Disconnect()
+	end)
+
+	-- Remove Magazine After x Seconds
+	delay(5, function()
+		local tweenInfo = TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+		TweenService:Create(clonedMag, tweenInfo, {Transparency = 1}):Play()
+		Debris:AddItem(clonedMag, 1)
+	end)
+end
+
+local function playSound(sound)
+	local newSound = sound:Clone()
+	newSound.Parent = sound.Parent
+	newSound.PlaybackSpeed = Random.new():NextNumber(0.8, 1.2)
+	newSound.PlayOnRemove = true
+	newSound:Destroy()
+end
+
+function FirearmClient.new(instance, replicatedData)
+	local self = setmetatable(ItemClass.new(instance), FirearmClient)
+	
+	-- Config
+	self.config = require(ReplicatedStorage.Modules.Configs.ItemConfigs:FindFirstChild(instance.Name))
+	
+	-- Replicated Data
+	self.ammo = replicatedData.ammo or self.config.MagazineCapacity
+	self.fireType = replicatedData.fireType or self.config.FireTypes[1]
+	self.magazines = replicatedData.magazines or math.huge
+	
+	-- Client Data
+	self.triggerDown = false
+	self.roundChambered = false
+	self.reloading = false
+	self.aiming = false
+	self.stance = STANCE_ENUMS.Idle
+	self.lastStance = self.lastStance
+	self.aimKeyDown = false
+	self.muzzleBlockedOffset = CFrame.new()
+	self.muzzleBlocked = false
+	
+	-- Springs
+	self.springs = {}
+	self.springs.cameraRecoil = Spring.create()
+	self.springs.viewmodelRecoil = Spring.create()
+	self.springs.viewmodelRotation = Spring.create()
+	
+	-- Bullet Caster
+	self.bulletCaster = BulletCaster.new(self)
+	
+	-- Item Events
+	self.CharacterChanged:Connect(function(oldCharacter, newCharacter)
+		if newCharacter == PLAYER.Character then
+			self:LoadAnimations()
+		else
+			self:UnloadAnimations()
+		end
+	end)
+	self.Equipped:Connect(function()
+		self:Equip()
+	end)
+	self.Unequipped:Connect(function()
+		self:Unequip()
+	end)
+	
+	if self.character == PLAYER.Character then
+		self:LoadAnimations()
+	end
+	
+	cache[instance] = self
+	
+	return self
+end
+
+function FirearmClient:LoadAnimations()
+	local humanoid = self.character:WaitForChild("Humanoid")
+	local animator = humanoid:WaitForChild("Animator")
+	if not humanoid or not animator then return end
+	self.animController = AnimationController.new(animator, self.config.Animations)
+end
+
+function FirearmClient:UnloadAnimations()
+	if self.animController then
+		self.animController:Destroy()
+	end
+end
+
+function FirearmClient:BindControls()
+	local function triggerDown(_, inputState, inputObject)
+		if inputState == Enum.UserInputState.Begin then
+			if not self.playerController.cameraFirstPerson and self.stance == STANCE_ENUMS.Idle then return end
+			if self.playerController.sprinting then return end
+
+			self.triggerDown = true
+			self.playerController:ToggleSprintingEnabled(false)
+			self:PullTrigger()
+		elseif inputState == Enum.UserInputState.End then
+			self.triggerDown = false
+			self.playerController:ToggleSprintingEnabled(true)
+		end
+	end
+	local function reload(_, inputState, inputObject)
+		if inputState ~= Enum.UserInputState.Begin then return end
+		self:Reload()
+	end
+
+	local function switchFiremode(_, inputState, inputObject)
+		if inputState ~= Enum.UserInputState.Begin then return end
+		self:SwitchFireType()
+	end
+	local function switchStance(_, inputState, inputObject)
+		if inputState ~= Enum.UserInputState.Begin then return end
+		if self.playerController.sprinting then return end
+
+		if self.playerController.cameraFirstPerson then
+			if self.stance == STANCE_ENUMS.Ready then
+				self:SwitchStance(STANCE_ENUMS.Idle)
+			elseif self.stance == STANCE_ENUMS.Idle then
+				self:SwitchStance(STANCE_ENUMS.Ready)
+			end
+		end
+	end
+	local function aim(_, inputState, inputObject)
+		if self.playerController.cameraFirstPerson then
+			if inputState == Enum.UserInputState.Begin then
+				self.aimKeyDown = true
+				--if self.muzzleBlocked then return end
+				self:SwitchStance(STANCE_ENUMS.Aiming)
+			elseif inputState == Enum.UserInputState.End then
+				self.aimKeyDown = false
+				--if self.muzzleBlocked then return end
+				self:SwitchStance(STANCE_ENUMS.Ready)
+			end
+		else
+			if inputState == Enum.UserInputState.Begin then
+				self.aimKeyDown = true
+				self:SwitchStance(STANCE_ENUMS.Aiming)
+			elseif inputState == Enum.UserInputState.End then
+				self.aimKeyDown = false
+				self:SwitchStance(STANCE_ENUMS.Idle)
+			end
+		end
+	end
+
+	ContextActionService:BindAction("Pull Trigger", triggerDown, false, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonR2)
+	ContextActionService:BindAction("Reload", reload, false, Enum.KeyCode.R, Enum.KeyCode.ButtonX)
+	ContextActionService:BindAction("Switch Firemode", switchFiremode, false, Enum.KeyCode.V, Enum.KeyCode.DPadLeft)
+	ContextActionService:BindAction("Switch Stance", switchStance, false, Enum.KeyCode.Q, Enum.KeyCode.DPadRight)
+	ContextActionService:BindAction("Aim", aim, false, Enum.UserInputType.MouseButton2, Enum.KeyCode.ButtonL2)
+end
+
+function FirearmClient:Equip()
+	
+	-- Update Replicated Data
+	local replicatedData = Knit.GetService("ItemService"):GetItemData(self.instance)
+	self.ammo = replicatedData.ammo
+	self.fireType = replicatedData.fireType
+	self.magazines = replicatedData.magazines
+	
+	-- Check If Owner, If Not Then End Function
+	if self.player ~= PLAYER then return end
+	
+	self.distance = (self.character.RightUpperArm.Position - self.instance.Muzzle.Position).Magnitude
+	
+	-- Load Animations If Not Loaded
+	if not self.animController then
+		self:LoadAnimations()
+	end
+	
+	-- Create Kill Effect
+	self.killEffect = Instance.new("ColorCorrectionEffect")
+	self.killEffect.Parent = LightingService
+	
+	-- Create Aim Effect
+	self.aimEffect = Instance.new("DepthOfFieldEffect")
+	self.aimEffect.FarIntensity = 0
+	self.aimEffect.FocusDistance = 0
+	self.aimEffect.InFocusRadius = 5
+	self.aimEffect.NearIntensity = 0.25
+	self.aimEffect.Parent = LightingService
+	
+	-- Manage Player Controller
+	self.viewmodelController = Knit.GetController("ViewmodelController")
+	self.playerController = Knit.GetController("PlayerController")
+	self.playerController:LockMouseToCenter()
+	if self.playerController.cameraFirstPerson then
+		self:SwitchStance(STANCE_ENUMS.Ready)
+	else
+		self:SwitchStance(STANCE_ENUMS.Idle)
+	end
+	
+	-- Manage Player Controller Events
+	local function updateStance()
+		if self.equipped then self.playerController:LockMouseToCenter() end
+		if self.playerController.sprinting then
+			self:SwitchStance(STANCE_ENUMS.Sprinting)
+		else
+			if self.playerController.cameraFirstPerson then
+				self:SwitchStance(STANCE_ENUMS.Ready)
+			else
+				self:SwitchStance(STANCE_ENUMS.Idle)
+			end
+		end
+	end
+	self.cameraPerspectiveChanged = self.playerController.cameraPerspectiveChanged:Connect(updateStance)
+	self.sprintStateChanged = self.playerController.sprintingChanged:Connect(updateStance)
+	
+	-- Handle Equipping
+	local equipAnim = self.animController:PlayAnimation("Equip", false, 0, 0.25)
+	local equipTimer = Knit.GetController("TimerController").new(equipAnim.Length)
+	equipTimer:Start()
+	equipTimer.Stopped:Wait()
+	equipTimer:Destroy()
+	
+	-- Manage Controls
+	self:BindControls()
+	
+	-- Bind RenderStep Event
+	RunService:BindToRenderStep(self.instance.Name, Enum.RenderPriority.Input.Value, function(dt)
+
+		-- Handle Recoil
+		local recoil = self.springs.cameraRecoil:update(dt)
+		CAMERA.CFrame = CAMERA.CFrame * CFrame.Angles(recoil.x, recoil.y, recoil.z)
+
+		-- Bump Firearm
+		local bump = self.springs.viewmodelRecoil:update(dt)
+		self.viewmodelController.viewmodelCFrame = self.viewmodelController.viewmodelCFrame * CFrame.new(bump.x, bump.y, bump.z)
+
+		-- Rotate Firearm
+		local rotate = self.springs.viewmodelRotation:update(dt)
+		self.viewmodelController.viewmodelCFrame = self.viewmodelController.viewmodelCFrame * CFrame.Angles(rotate.x, rotate.y, rotate.z)
+
+		-- Handle Muzzle Block
+		if self.character.RightUpperArm then
+			local raycastParams = RaycastParams.new()
+			raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+			raycastParams.FilterDescendantsInstances = {self.character, CAMERA, workspace:FindFirstChild("CosmeticBulletsFolder")}
+			local muzzlePos = self.instance.Muzzle.Position + (self.instance.Muzzle.CFrame.LookVector * 1.3)
+			local muzzleRaycast = workspace:Raycast(muzzlePos, self.instance.Handle.Position - muzzlePos, raycastParams)
+			if muzzleRaycast then
+				self.muzzleBlockedOffset = self.muzzleBlockedOffset:Lerp(CFrame.new(0 ,0, muzzleRaycast.Distance * 2), 0.05)
+				if self.muzzleBlockedOffset.Position.Z >= 0.1 then
+					self.muzzleBlocked = true
+					if self.stance == STANCE_ENUMS.Aiming then
+						self:SwitchStance(STANCE_ENUMS.Ready)
+					end
+				else
+					self.muzzleBlocked = false
+					self.muzzleBlockedOffset = self.muzzleBlockedOffset:Lerp(CFrame.new(), 0.05)
+				end
+			else
+				self.muzzleBlocked = false
+				self.muzzleBlockedOffset = self.muzzleBlockedOffset:Lerp(CFrame.new(), 0.05)
+			end
+		end
+
+		-- Fix Re-Aiming
+		if not self.muzzleBlocked and self.aimKeyDown and self.stance ~= STANCE_ENUMS.Aiming then
+			self:SwitchStance(STANCE_ENUMS.Aiming)
+		end
+		if self.stance == STANCE_ENUMS.Aiming and not self.aimKeyDown then
+			self:SwitchStance(STANCE_ENUMS.Ready)
+		end
+
+		-- Handle Aiming
+		if self.aiming then
+			-- Aiming CFrame
+			local viewmodelCFrame = self.viewmodelController.viewmodelCFrame
+			self.viewmodelController.viewmodelCFrame = viewmodelCFrame:Lerp(viewmodelCFrame * self.instance:FindFirstChild("AimPart", true).CFrame:ToObjectSpace(CAMERA.CFrame), 0.2)
+
+			-- Depth Of Field
+			local sightMagnitude = (self.instance:FindFirstChild("AimPart", true).Position - self.instance.FrontAimPart.Position).Magnitude
+			self.aimEffect.FocusDistance = Lerp(self.aimEffect.FocusDistance, sightMagnitude * 2, 0.2)
+
+		else
+			-- Aiming CFrame
+			local viewmodelCFrame = self.viewmodelController.viewmodelCFrame
+			self.viewmodelController.viewmodelCFrame = viewmodelCFrame:Lerp(CFrame.new(0, -1.7, -0.3), 0.2)
+
+			-- Depth Of Field
+			self.aimEffect.FocusDistance = Lerp(self.aimEffect.FocusDistance, 0, 0.2)
+		end
+		self.viewmodelController.viewmodelCFrame = self.viewmodelController.viewmodelCFrame * self.muzzleBlockedOffset
+	end)
+end
+
+function FirearmClient:UnbindControls()
+	ContextActionService:UnbindAction("Pull Trigger")
+	ContextActionService:UnbindAction("Reload")
+	ContextActionService:UnbindAction("Switch Firemode")
+	ContextActionService:UnbindAction("Switch Stance")
+	ContextActionService:UnbindAction("Aim")
+end
+
+function FirearmClient:Unequip(lastPlayer)
+	
+	-- Update Replicated Data
+	local replicatedData = Knit.GetService("ItemService"):GetItemData(self.instance)
+	self.ammo = replicatedData.ammo
+	self.fireType = replicatedData.fireType
+	self.magazines = replicatedData.magazines
+	
+	-- Check If Owner, If Not Then End Function
+	if self.player ~= PLAYER then return end
+	
+	-- Unbind Controls
+	self:UnbindControls()
+	
+	-- Unbind RenderStep Event
+	RunService:UnbindFromRenderStep(self.instance.Name)
+	
+	-- Manage Player Controller
+	self.playerController:UnlockCharacterRotation()
+	if not self.playerController.cameraFirstPerson then
+		self.playerController:UnlockMouse()
+	end
+	self.cameraPerspectiveChanged:Disconnect()
+	self.sprintStateChanged:Disconnect()
+	self.playerController = nil
+	self.viewmodelController = nil
+	
+	-- Destroy Effects
+	self.killEffect:Destroy()
+	self.aimEffect:Destroy()
+	
+	-- Manage Animations
+	self.animController:StopAllAnimations(0.25)
+end
+
+function FirearmClient:PullTrigger()
+	if not self.triggerDown then return end
+	if self.fireType == "Safe" then return end
+	if self.ammo < 1 then
+		playSound(self.instance.Handle.TriggerPull)
+		return
+	end
+	
+	repeat
+		if not self.triggerDown or self.ammo < 1 then break end
+		self:Fire()
+		self.roundChambered = false
+		task.wait(60 / self.config.FireRate)
+		self.roundChambered = true
+	until not self.triggerDown or self.ammo < 1
+end
+
+function FirearmClient:Fire()
+	if not self.roundChambered then return end
+	
+	-- Manage Mechanisms
+	self.ammo -= 1
+	if self.ammo < 1 then
+		self.roundChambered = false
+	end
+	if self.fireType == "Semi" then
+		self.triggerDown = false
+	end
+	
+	-- Play Effects
+	playSound(self.instance.Muzzle.Fire)
+	self.instance.Muzzle.MuzzleFlashEffect:Emit(10)
+	self.instance.Muzzle.MuzzleSmokeEffect:Emit(10)
+	if not self.playerController.cameraFirstPerson then
+		self.animController:PlayAnimation("Fire")
+	end
+	
+	-- Send Event
+	local muzzleDirection = self.instance.Muzzle.CFrame.LookVector * 1000
+	CLIENT_COMM:GetSignal("Fire"):Fire(self.instance, self.instance.Muzzle.Position, muzzleDirection)
+	
+	-- Fire Bullet
+	self.bulletCaster:Fire(self.instance.Muzzle.Position, muzzleDirection)
+	
+	-- Bump Springs
+	local cameraRecoil = Vector3.new(
+		Random.new():NextNumber(self.config.Recoil.Camera.Rotation.X.Min, self.config.Recoil.Camera.Rotation.X.Max),
+		Random.new():NextNumber(self.config.Recoil.Camera.Rotation.Y.Min, self.config.Recoil.Camera.Rotation.Y.Max),
+		0
+	)
+	local viewmodelRotation = Vector3.new(
+		Random.new():NextNumber(self.config.Recoil.Viewmodel.Rotation.X.Min, self.config.Recoil.Viewmodel.Rotation.X.Max),
+		Random.new():NextNumber(self.config.Recoil.Viewmodel.Rotation.Y.Min, self.config.Recoil.Viewmodel.Rotation.Y.Max),
+		0
+	)
+	local viewmodelRecoil = Vector3.new(
+		Random.new():NextNumber(self.config.Recoil.Viewmodel.Position.X.Min, self.config.Recoil.Viewmodel.Position.X.Max),
+		Random.new():NextNumber(self.config.Recoil.Viewmodel.Position.Y.Min, self.config.Recoil.Viewmodel.Position.Y.Max),
+		Random.new():NextNumber(self.config.Recoil.Viewmodel.Position.Z.Min, self.config.Recoil.Viewmodel.Position.Z.Max)
+	)
+
+	if not self.playerController.cameraFirstPerson then
+		cameraRecoil *= 2
+	end	
+
+	self.springs.cameraRecoil:shove(cameraRecoil)
+	self.springs.viewmodelRotation:shove(viewmodelRotation)
+	self.springs.viewmodelRecoil:shove(viewmodelRecoil)
+end
+
+function FirearmClient:_Fired(origin, direction)
+	
+	-- Play Muzzle Effects
+	self.instance.Muzzle.MuzzleFlashEffect:Emit(10)
+	self.instance.Muzzle.MuzzleSmokeEffect:Emit(10)
+
+	-- Play Sounds
+	local distance = (self.instance.Muzzle.Position - PLAYER.Character.PrimaryPart.Position).Magnitude
+	if distance < 250 then
+		playSound(self.instance.Muzzle.Fire)
+	else
+		delay((distance / 250) / 4, function()
+			playSound(self.instance.Muzzle.FireEcho)
+		end)
+	end
+
+	-- Decrease Ammo For Sync
+	self.ammo -= 1
+end
+
+function FirearmClient:Reload()
+	if self.reloading then return end
+	self.reloading = true
+
+	-- Keep Round In Chamber
+	if self.ammo > 0 and self.roundChambered then
+		self.ammo = 1
+	end
+
+	-- Play Effects
+	local cameraRecoil = Vector3.new(
+		Random.new():NextNumber(self.config.Recoil.Camera.Rotation.X.Min, self.config.Recoil.Camera.Rotation.X.Max),
+		Random.new():NextNumber(self.config.Recoil.Camera.Rotation.Y.Min, self.config.Recoil.Camera.Rotation.Y.Max),
+		0
+	)
+
+	local reloadAnim = self.animController:PlayAnimation("Reload")
+	local reachedMarker = reloadAnim:GetMarkerReachedSignal("PlaySound"):Connect(function(soundName)
+		if soundName == "MagOut" then
+			playSound(self.instance.Magazine.MagOut)
+			dropMagazine(self.instance.Magazine)
+			self.springs.cameraRecoil:shove(cameraRecoil)
+		elseif soundName == "MagIn" then
+			playSound(self.instance.Magazine.MagIn)
+			self.instance.Magazine.Transparency = 0
+			self.springs.cameraRecoil:shove(cameraRecoil)
+		elseif soundName == "BoltPull" then
+			playSound(self.instance.Bolt.BoltPull)
+		elseif soundName == "BoltRelease" then
+			playSound(self.instance.Bolt.BoltRelease)
+		end
+	end)
+
+	-- Play Timer
+	local timer = Knit.GetController("TimerController").new(reloadAnim.Length)
+	timer:Start()
+
+	-- Send Event
+	CLIENT_COMM:GetSignal("Reload"):Fire(self.instance)
+
+	-- Finished Reloading
+	timer.Stopped:Wait()
+	timer:Destroy()
+	reachedMarker:Disconnect()
+
+	-- Finish Reloading
+	self.reloading = false
+
+	-- Ensure Firearm Is Still Equipped
+	if self.equipped then
+		self.ammo = self.config.MagazineCapacity
+		self.roundChambered = true
+	end
+end
+
+function FirearmClient:_Reloaded()
+	
+	local animController = AnimationController.new(self.character.Humanoid.Animator, self.config.Animations)
+	local reloadAnim = animController:PlayAnimation("Reload")
+	local reachedMarker = reloadAnim:GetMarkerReachedSignal("PlaySound"):Connect(function(soundName)
+		if soundName == "MagOut" then
+			playSound(self.instance.Magazine.MagOut)
+			dropMagazine(self.instance.Magazine)
+		elseif soundName == "MagIn" then
+			playSound(self.instance.Magazine.MagIn)
+			self.instance.Magazine.Transparency = 0
+		elseif soundName == "BoltPull" then
+			playSound(self.instance.Bolt.BoltPull)
+		elseif soundName == "BoltRelease" then
+			playSound(self.instance.Bolt.BoltRelease)
+		end
+	end)
+	reloadAnim:AdjustSpeed()
+	reloadAnim.Stopped:Wait()
+	reachedMarker:Disconnect()
+	animController:Destroy()
+
+	self.ammo = self.config.MagazineCapacity
+end
+
+function FirearmClient:SwitchFireType(fireType)
+	
+	-- Manage Firetype
+	if fireType then
+		if self.config.FireTypes[fireType] then
+			self.fireType = fireType
+		end
+	else
+		_, self.fireType = next(self.config.FireTypes, table.find(self.config.FireTypes, self.fireType))
+		if self.fireType == nil then self.fireType = self.config.FireTypes[1] end
+	end
+	
+	-- Play Effects
+	playSound(self.instance.Handle.FireSelect)
+	
+	-- Send Event
+	Knit.GetService("ItemService").RemoteEvent:Fire(self.instance, "_SwitchedFiremode", self.fireType)
+end
+
+function FirearmClient:_FireTypeChanged(newFireType)
+	self.fireType = newFireType
+	playSound(self.instance.Handle.FireSelect)
+end
+
+function FirearmClient:SwitchStance(stance)
+	
+	self.lastStance = self.stance
+	
+	-- Manage Stance
+	if typeof(stance) == "string" then
+		self.stance = STANCE_ENUMS[stance]
+	else
+		self.stance = stance
+	end
+	self.aiming = self.stance == STANCE_ENUMS.Aiming or false
+	
+	-- Manage Effects
+	self.animController:StopAnimation("Idle", 0.25)
+	self.animController:StopAnimation("Ready", 0.25)
+	self.animController:PlayAnimation(self.stance == STANCE_ENUMS.Idle and "Idle" or
+		self.stance == STANCE_ENUMS.Ready and "Ready" or
+		self.stance == STANCE_ENUMS.Aiming and "Ready" or
+		self.stance == STANCE_ENUMS.Sprinting and "Idle", 1
+	)
+	self.playerController:ToggleSprintingEnabled(self.stance ~= STANCE_ENUMS.Aiming and true or false)
+	if self.stance == STANCE_ENUMS.Idle then
+		self.playerController:UnlockCharacterRotation()
+	else
+		self.playerController:LockCharacterRotation()
+	end
+	
+	-- Manage UI
+	if not self.playerController.cameraFirstPerson then
+		local transparency = self.stance == STANCE_ENUMS.Aiming and not self.instance:FindFirstChild("Shield") and 0 or 1
+		TweenService:Create(self.player.PlayerGui.PlayerUI.Overlays.Cursor, TweenInfo.new(0.25), {ImageTransparency = transparency}):Play()
+	else
+		TweenService:Create(self.player.PlayerGui.PlayerUI.Overlays.Cursor, TweenInfo.new(0.25), {ImageTransparency = 1}):Play()
+	end
+end
+
+function FirearmClient:_StanceChanged(newStance)
+	
+end
+
+--// HOOKS //--
+CLIENT_COMM:GetSignal("Fire"):Connect(function(instance, origin, direction)
+	FirearmClient._Fired(cache[instance])
+end)
+CLIENT_COMM:GetSignal("Reload"):Connect(function(instance)
+	FirearmClient._Reloaded(cache[instance])
+end)
+CLIENT_COMM:GetSignal("SwitchFireType"):Connect(function(instance, newFiretype)
+	FirearmClient._FireTypeChanged(cache[instance])
+end)
+CLIENT_COMM:GetSignal("SwitchStance"):Connect(function(instance, oldStance, newStance)
+	FirearmClient._StanceChanged(cache[instance])
+end)
+
+--// EXECUTION //--
+FirearmClient.__index = FirearmClient
+setmetatable(FirearmClient, ItemClass)
+return FirearmClient
